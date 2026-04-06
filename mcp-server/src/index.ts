@@ -1,72 +1,84 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { queryClickHouse } from "./clickhouse.js";
-import path from "path";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { queryClickHouse, initDB } from "./clickhouse.js";
 import express from "express";
+import cors from "cors";
+import path from "path";
+import { fileURLToPath } from 'url';
 
-// 1. Serve the UI assets (in a real enterprise setup, use a CDN or Nginx)
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// 1. Initialize Database
+initDB().catch(console.error);
+
+// 2. Serve UI Assets
 const app = express();
-app.use("/ui", express.static(path.join(__dirname, "../public")));
-app.listen(3000, () => console.log("UI Assets serving on port 3000"));
+app.use(cors({ origin: '*' }));
+app.use("/ui", express.static(path.join(__dirname, "../../mcp-server/public")));
+app.listen(3000, () => console.error("UI Assets serving on port 3000"));
 
+// 3. MCP Server Setup
 const server = new Server(
   { name: "telemetry-explorer", version: "1.0.0" },
   { capabilities: { tools: {} } }
 );
 
-// 2. Define the tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "explore_telemetry",
-        description: "Visualize system logs and API telemetry data as an interactive dashboard.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            time_range: { type: "string", description: "e.g., 'last 24 hours'" },
-            service: { type: "string", description: "The microservice to filter by" }
-          },
-          required: ["time_range"]
-        },
-        // The magic: Telling the host to render the UI
-        _meta: {
-          ui: {
-            resourceUri: "http://localhost:3000/ui/index.html" 
-          }
-        }
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "explore_telemetry",
+      description: "Visualize system logs and API telemetry data as an interactive dashboard.",
+      inputSchema: {
+        type: "object",
+        properties: { time_range: { type: "string" } }
       },
-      {
-        name: "fetch_raw_logs",
-        description: "Fetch raw log lines for a specific timestamp. Used by the UI for drill-downs.",
-        inputSchema: {
-          type: "object",
-          properties: { timestamp: { type: "string" } }
-        }
+      _meta: { ui: { resourceUri: "http://localhost:3000/ui/index.html" } }
+    },
+    {
+      name: "fetch_raw_logs",
+      description: "Fetch raw log lines for a specific minute.",
+      inputSchema: {
+        type: "object",
+        properties: { timestamp: { type: "string" } }
       }
-    ]
-  };
-});
+    }
+  ]
+}));
 
-// 3. Handle Tool Execution
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name === "explore_telemetry") {
-    // Fetch initial aggregated data from ClickHouse
-    const data = await queryClickHouse("SELECT service, count() as errors FROM logs WHERE level='ERROR' GROUP BY service");
+    // Aggregate errors by minute for the time-series chart
+    const query = `
+      SELECT formatDateTime(toStartOfMinute(timestamp), '%Y-%m-%d %H:%M') as time, 
+             count() as errors 
+      FROM telemetry_logs 
+      WHERE level='ERROR' 
+      GROUP BY time ORDER BY time ASC
+    `;
+    const data = await queryClickHouse(query);
+    
+    // Markdown fallback for CLI environments
+    let md = `📊 **Telemetry Report**\n\n| Time | Errors |\n|---|---|\n`;
+    data.forEach((r: any) => md += `| ${r.time} | ${r.errors} |\n`);
+
     return {
-      content: [{ type: "text", text: JSON.stringify(data) }]
+      content: [
+        { type: "text", text: md },
+        { type: "text", text: `\n<data style="display:none;">${JSON.stringify(data)}</data>` }
+      ]
     };
   }
   
   if (request.params.name === "fetch_raw_logs") {
-    const data = await queryClickHouse(`SELECT * FROM logs WHERE timestamp = '${request.params.arguments.timestamp}'`);
-    return {
-      content: [{ type: "text", text: JSON.stringify(data) }]
-    };
+    const time = request.params.arguments?.timestamp;
+    const query = `SELECT * FROM telemetry_logs WHERE formatDateTime(timestamp, '%Y-%m-%d %H:%M') = '${time}'`;
+    const data = await queryClickHouse(query);
+    return { content: [{ type: "text", text: JSON.stringify(data) }] };
   }
   
   throw new Error("Tool not found");
 });
 
 const transport = new StdioServerTransport();
-server.connect(transport).catch(console.error);
+server.connect(transport).then(() => console.error("MCP Server running on stdio")).catch(console.error);
